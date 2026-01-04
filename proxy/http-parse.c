@@ -198,6 +198,7 @@ HTTP_PARSE http_parse_read_response(int server_sockfd,
             } else {
 
                 memcpy(node->buffer, buffer, chunk_len);
+                node->buf_len = chunk_len;
                 __sync_fetch_and_add(&entry->parts_done, 1);
                 pthread_cond_broadcast(&entry->new_part);
             }

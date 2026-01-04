@@ -26,7 +26,7 @@ typedef enum Error { SUCCESS, ERROR_REQUEST_UNSUPPORT } Error;
 #define URL_SIZE 1024
 #define MAX_URL_SIZE 1024 * 8
 #define MAX_CACHE_SIZE 20
-#define PORT 80
+#define PORT 8080
 #define METHOD_SIZE 4
 
 struct hashmap* cache;
@@ -36,7 +36,8 @@ pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cache_full = PTHREAD_COND_INITIALIZER;
 pthread_cond_t cache_available = PTHREAD_COND_INITIALIZER;
 size_t cache_size;
-int terminate;
+volatile int terminate;
+int server_sockfd_global;
 
 typedef struct RemoteServer {
     char* url;
@@ -69,6 +70,7 @@ void* cache_gc_monitor(void* arg) {
         }
 
         if (terminate) {
+            pthread_cond_broadcast(&cache_available);
             pthread_mutex_unlock(&cache_lock);
             break;
         }
@@ -85,6 +87,7 @@ void* cache_gc_monitor(void* arg) {
         pthread_mutex_unlock(&cache_lock);
     }
 
+    printf("[INFO] GC monitor thread exiting\n");
     return NULL;
 }
 
@@ -252,12 +255,18 @@ void* handle_client(void* arg) {
     int amount_to_read = 0;
 
     pthread_mutex_lock(&entry->wait_lock);
-    while (entry->parts_done == 0 && !entry->done) {
+    while (entry->parts_done == 0 && !entry->done && !terminate) {
         pthread_cond_wait(&entry->new_part, &entry->wait_lock);
     }
     pthread_mutex_unlock(&entry->wait_lock);
 
-    char* buffer[BUFFER_SIZE];
+    if (terminate) {
+        cache_entry_sub(entry);
+        close(client_sockfd);
+        return NULL;
+    }
+
+    char buffer[BUFFER_SIZE];
     pthread_rwlock_rdlock(&entry->lock);
     List* node = entry->data;
     amount_to_read = node->buf_len;
@@ -298,10 +307,14 @@ void* handle_client(void* arg) {
                 pthread_rwlock_unlock(&entry->lock);
             } else {
                 pthread_mutex_lock(&entry->wait_lock);
-                while (parts_read == entry->parts_done && !entry->done) {
+                while (parts_read == entry->parts_done && !entry->done && !terminate) {
                     pthread_cond_wait(&entry->new_part, &entry->wait_lock);
                 }
                 pthread_mutex_unlock(&entry->wait_lock);
+
+                if (terminate) {
+                    break;
+                }
 
                 pthread_rwlock_rdlock(&entry->lock);
                 node = node->next;
@@ -320,11 +333,38 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
+void wakeup_all_waiting_threads() {
+    pthread_mutex_lock(&cache_lock);
+
+    size_t iter = 0;
+    void* item;
+    while (hashmap_iter(cache, &iter, &item)) {
+        HashValue* value = (HashValue*)item;
+        CacheEntry* entry = value->entry;
+
+        pthread_mutex_lock(&entry->wait_lock);
+        pthread_cond_broadcast(&entry->new_part);
+        pthread_mutex_unlock(&entry->wait_lock);
+    }
+
+    pthread_mutex_unlock(&cache_lock);
+}
+
 void SIGINT_handler(int signo) {
     if (signo == SIGINT) {
         if (!terminate) {
+            const char msg[] = "\n[INFO] Received SIGINT, initiating shutdown...\n";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
             terminate = 1;
+
+            if (server_sockfd_global >= 0) {
+                shutdown(server_sockfd_global, SHUT_RDWR);
+            }
+
+            wakeup_all_waiting_threads();
         } else {
+            const char msg[] = "\n[INFO] Received second SIGINT, forcing exit...\n";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
             syscall(SYS_exit_group, 0);
         }
     }
@@ -333,11 +373,18 @@ void SIGINT_handler(int signo) {
 int main() {
     int err;
     terminate = 0;
+    server_sockfd_global = -1;
 
-    sig_t sig_error = signal(SIGINT, SIGINT_handler);
-    if (sig_error == SIG_ERR) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIGINT_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
         fprintf(stderr, "[ERROR] Unable to set SIGINT handler: %s\n",
                 strerror(errno));
+        return -1;
     }
 
     int server_sockfd = create_server_socket_and_listen(PORT);
@@ -345,14 +392,15 @@ int main() {
         printf("[ERROR] Error starting proxy server\n");
         return -1;
     }
+    server_sockfd_global = server_sockfd;
 
     cache = cache_create();
     cache_size = 0;
     queue_head = NULL;
 
-    sig_error = signal(SIGPIPE, SIG_IGN);
+    sig_t sig_error = signal(SIGPIPE, SIG_IGN);
     if (sig_error == SIG_ERR) {
-        fprintf(stderr, "[ERROR] Unable to ingore SIGPIPE %s\n",
+        fprintf(stderr, "[ERROR] Unable to ignore SIGPIPE %s\n",
                 strerror(errno));
     }
 
@@ -368,7 +416,7 @@ int main() {
     }
 
     pthread_t gc_thread;
-    err = pthread_create(&gc_thread, &attr, cache_gc_monitor, NULL);
+    err = pthread_create(&gc_thread, NULL, cache_gc_monitor, NULL);
     if (err) {
         fprintf(stderr, "[ERROR] Failed to create GC monitor thread\n");
         return -1;
@@ -377,7 +425,7 @@ int main() {
 
     while (!terminate) {
         struct sockaddr_in client_addr;
-        socklen_t client_len;
+        socklen_t client_len = sizeof(client_addr);
 
         int client_sockfd =
             accept(server_sockfd, (struct sockaddr*)&client_addr, &client_len);
@@ -387,7 +435,7 @@ int main() {
                 continue;
             }
 
-            fprintf(stderr, "[ERROR] Unable to accept new client");
+            fprintf(stderr, "[ERROR] Unable to accept new client\n");
             continue;
         }
 
@@ -404,9 +452,22 @@ int main() {
         }
     }
 
+    printf("[INFO] Shutting down proxy server...\n");
+    close(server_sockfd);
+
     pthread_mutex_lock(&cache_lock);
     pthread_cond_broadcast(&cache_full);
+    pthread_cond_broadcast(&cache_available);
     pthread_mutex_unlock(&cache_lock);
 
-    pthread_exit(NULL);
+    pthread_join(gc_thread, NULL);
+    printf("[INFO] GC thread joined\n");
+
+    hashmap_free(cache);
+    printf("[INFO] Cache cleaned up\n");
+
+    pthread_attr_destroy(&attr);
+    printf("[INFO] Proxy server terminated successfully\n");
+
+    return 0;
 }
